@@ -1,4 +1,4 @@
-# Copyright (c) 2016-2020, Thomas Larsson
+ # Copyright (c) 2016-2020, Thomas Larsson
 # All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
@@ -35,9 +35,518 @@ from .error import *
 from .material import MaterialMerger
 import string
 import random
+from collections import OrderedDict
+
 #-------------------------------------------------------------
 #   Merge geografts
 #-------------------------------------------------------------
+
+class DAZ_OT_MergeGeograftsFast(DazOperator, MaterialMerger, IsMesh):
+    bl_idname = "daz.merge_geografts_fast"
+    bl_label = "Merge Geografts Fast"
+    bl_description = "Merge selected geografts to active object (fast version)"
+    bl_options = {'UNDO'}
+
+
+    def run(self, context):
+        from .driver import getShapekeyDrivers, copyShapeKeyDrivers
+
+
+        #cob = bpy.data.objects['Genesis 3 Female Mesh']
+        #aob = bpy.data.objects['Genesis 3 Female Genitalia.001']
+
+        cob = context.object
+        ncverts = len(cob.data.vertices)
+
+        # Find anatomies and move graft verts into position
+        anatomies = []
+        for aob in getSceneObjects(context):
+            if (aob.type == 'MESH' and
+                getSelected(aob) and
+                aob != cob and
+                aob.data.DazGraftGroup):
+                anatomies.append(aob)
+
+        if len(anatomies) < 1:
+            raise DazError("At least two meshes must be selected.\nGeografts selected and target active.")
+
+        for aob in anatomies:
+            if aob.data.DazVertexCount != ncverts:
+                if cob.data.DazVertexCount == len(aob.data.vertices):
+                    msg = ("Meshes selected in wrong order.\nGeografts selected and target active.   ")
+                else:
+                    msg = ("Geograft %s fits mesh with %d vertices,      \nbut %s has %d vertices." %
+                        (aob.name, aob.data.DazVertexCount, cob.name, ncverts))
+                raise DazError(msg)
+
+        cname = self.getUvName(cob.data)
+        anames = []
+        drivers = {}
+
+        # Keep extra UVs
+        self.keepUv = []
+        for ob in [cob] + anatomies:
+            for uvtex in getUvTextures(ob.data):
+                if not uvtex.active_render:
+                    self.keepUv.append(uvtex.name)
+
+        # Select graft group for each anatomy
+        for aob in anatomies:
+            activateObject(context, aob)
+            self.moveGraftVerts(aob, cob) # moveGraftVerts: moves all common geograft vertices to the location of the coresponding vertices. It also `fixes` the vertices in shared shapekey names
+            getShapekeyDrivers(aob, drivers)
+            for uvtex in getUvTextures(aob.data):
+                if uvtex.active_render:
+                    anames.append(uvtex.name)
+                else:
+                    self.keepUv.append(uvtex.name)
+
+
+
+
+
+        preservableVertexIndices = []
+        removableEdgeIndices = []
+        for aob in anatomies:                    
+
+            # those are the faces on geograft that daz is supposed to mask/hide/remove when the geograft is applied   
+            # all faces !!! included in the geograft boundaries/replaceable faces also the ones to be removed         
+            # but this is a complicated problem, if we delete the edges a bit later, it also shifts the faces count, so maybe we can't delete them?!? maybe later?!?
+            maskedFaceIndices = [ item.a for item in aob.data.DazMaskGroup ]
+
+            # but from those faces, we are going to get the vertices that makes them
+            # all vertices !!! included in the geograft boundaries/replaceable vertices also the ones to be removed
+            maskedVertexIndices = []
+            for findex in maskedFaceIndices:
+                vIndexArray = [cob.data.polygons[findex].vertices[i] for i in range(len(cob.data.polygons[findex].vertices))]  #there can be faces made from 3 or 4 vertices 
+                maskedVertexIndices.extend(vIndexArray)
+
+            # list of vertices that are merged in the body
+            mergingBodyVerticesList=[]
+            for item in aob.data.DazGraftGroup:
+                mergingBodyVerticesList.append(item.b)
+
+            # those are the vertices we should in theory to keep (those are not on the merging boundary)
+            preservableVertexIndices = []
+            for element in maskedVertexIndices:
+                if element not in mergingBodyVerticesList:
+                    preservableVertexIndices.append(element)
+
+
+
+            #preservableVertexIndices = maskedVertexIndices - mergingBodyVerticesList
+
+            for edge in cob.data.edges:
+                v1 = edge.vertices[0]
+                v2 = edge.vertices[1]
+                if v1 in maskedVertexIndices and v2 in maskedVertexIndices: #if both vertices of the edge are in the geograft merging/replaceable vertices list
+                    if v1 in mergingBodyVerticesList and v2 in mergingBodyVerticesList: #if both vertices of the edge are to be merged/replaced then ignore this edge
+                        continue
+                    if v1 in preservableVertexIndices and v2 in preservableVertexIndices: #this is the edge we want to keep in order to maintain the face (easy scaling)
+                        continue
+                    removableEdgeIndices.append(edge.index) # finally we find an edge that is not in the boundary and we dont want to keep
+
+
+
+        activateObject(context, cob)
+        bpy.ops.object.mode_set(mode='EDIT')
+        bpy.ops.mesh.select_mode(type="VERT")
+        bpy.ops.mesh.select_all(action='DESELECT')
+        bpy.ops.mesh.select_mode(type="EDGE")
+        bpy.ops.mesh.select_all(action='DESELECT')
+        bpy.ops.object.mode_set(mode='OBJECT')
+        for edgeIndex in removableEdgeIndices:
+            cob.data.edges[edgeIndex].select= True
+        bpy.ops.object.mode_set(mode='EDIT')
+        ##############################################################################################################
+        bpy.ops.mesh.delete(type='EDGE')                        # DELETE EDGE
+        ##############################################################################################################
+        bpy.ops.mesh.select_mode(type="VERT")
+        bpy.ops.object.mode_set(mode='OBJECT')
+
+        rvs = OrderedDict()
+        for aob in anatomies:
+            aobVertexCount = len(aob.data.vertices)
+            dazGraftGroupAfterJoinDict=OrderedDict()
+            for item in aob.data.DazGraftGroup:
+                print("original matching: {0}:{1}".format(item.a,item.b))
+                dazGraftGroupAfterJoinDict[item.a+len(cob.data.vertices)]=item.b                  #that -1 is very important, tricky!!!
+            for k, v in dazGraftGroupAfterJoinDict.items():
+                print("shifted matching: {0}:{1}".format(k,v))
+            rvs = reversed(dazGraftGroupAfterJoinDict.items())
+            for k, v in rvs:
+                print("reversed - {0}:{1}".format(k,v))
+
+            setSelected(aob, True)
+            activateObject(context, cob)
+            setSelected(aob, True)
+            bpy.ops.object.mode_set(mode='EDIT')
+            bpy.ops.mesh.select_all(action='DESELECT')
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+            bpy.ops.object.join()
+            bpy.ops.object.mode_set(mode='EDIT')
+            bpy.ops.mesh.select_all(action='DESELECT')
+            bpy.ops.object.mode_set(mode='OBJECT')
+            counter= 0
+            print("rvs size...")
+            rvs = reversed(dazGraftGroupAfterJoinDict.items())
+            for k, v in rvs:
+                print("merging - {0}:{1}".format(k,v))
+                cob.data.vertices[v].select = True # this is the vertex added from the aob (anatomy)
+                cob.data.vertices[k].select = True # this is the original vertex from cob (body)
+                #
+                counter = counter+1
+                bpy.ops.object.mode_set(mode='EDIT')
+                #cob.data.vertices[v].co = cob.data.vertices[k].co 
+                bpy.ops.mesh.merge(type='CENTER', uvs=False)
+                #threshold = 0.001*cob.DazScale
+                #bpy.ops.mesh.remove_doubles(threshold=threshold)   
+                bpy.ops.mesh.select_all(action='DESELECT')             
+                bpy.ops.object.mode_set(mode='OBJECT')
+                #ob.data.update()
+            #
+            #range ( start , end , increment/decrement ) where start is inclusive , end is exclusive and increment can be any numbers and behaves like step  
+            #for k, v in rvs:
+            #    print("merging - {0}:{1}".format(k,v))
+            #    cob.data.vertices[k].select = True # this is the vertex added from the aob (anatomy)            
+            #for c in range (len(cob.data.vertices)-1, len(cob.data.vertices) - aobVertexCount -1,-1):
+            #    cob.data.vertices[c].select = True
+            #for k, v in reversed(dazGraftGroupAfterJoinDict.items()):
+            #    print("{0}:{1}".format(k,v))
+            #    cob.data.vertices[k].select = True # this is the vertex added from the aob (anatomy)
+            for p in preservableVertexIndices:
+                cob.data.vertices[p].select = True 
+            bpy.ops.object.mode_set(mode='EDIT')
+            bpy.ops.transform.resize(value=(0.0, 0.0, 0.0) )
+            bpy.ops.mesh.select_all(action='DESELECT')
+
+        bpy.ops.object.mode_set(mode='OBJECT')
+        self.joinUvTextures(cob.data)
+
+        newname = self.getUvName(cob.data)
+        for mat in cob.data.materials:
+            if mat.use_nodes:
+                replaceNodeNames(mat, cname, newname)
+                for aname in anames:
+                    replaceNodeNames(mat, aname, newname)
+
+        # Remove unused materials
+        self.mathits = dict([(mn,False) for mn in range(len(cob.data.materials))])
+        for f in cob.data.polygons:
+            self.mathits[f.material_index] = True
+        self.mergeMaterials(cob)
+
+        copyShapeKeyDrivers(cob, drivers)
+        updateDrivers(cob)            
+        """   
+            activateObject(context, cob)
+            setSelected(cob, True)
+
+         
+            bpy.ops.object.join()
+            bpy.ops.object.mode_set(mode='EDIT')
+            bpy.ops.mesh.select_all(action='DESELECT')
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+        """
+        """
+        for aob in anatomies:
+            activateObject(context, aob)
+            setSelected(aob, True)
+            bpy.ops.object.mode_set(mode='EDIT')
+            bpy.ops.mesh.select_all(action='DESELECT')
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+            
+
+
+
+        # For the body, setup mask groups
+        activateObject(context, cob)
+        nverts = len(cob.data.vertices)
+        vfaces = dict([(vn,[]) for vn in range(nverts)]) # {0: [9337, 9346, 10746, 10755], 1: [9806, 9811, 11215, 11220], 2: [1685, 2398, 8644, 10053], 3: [2047, 2760, 9922, 11331], 4: [9156, 9157, 10565, 10566], 5: [9155, 9203, 10564, 10612], 6: [9154, 9155, 10563, 10564], 7: [9154, 9409, 10563, 10818], 8: [1978, 1986, 2691, 2699], 9: [1975, 1983, 2688, 2696], 10: [1978, 1980, 2691, 2693], 11: [1685, 2165, 2398, 2878], 12: [9158, 9169, 10567, 10578], 13: [3086, 3103, 3188, 3205], ...}
+        for f in cob.data.polygons:                      # 0 is the vertex index, and 9337, 9346, 10746, 10755 are faces the 0 indexed vertex belongs to !!! (is not the other way around!!!)
+            for vn in f.vertices:
+                vfaces[vn].append(f.index) #we build vertex index array which holds all faces index that contains this vertex
+
+        masked_array =[]  #added by me
+        nfaces = len(cob.data.polygons)
+        #fmasked is going to tell me which face is masked (which face index)
+        fmasked = dict([(fn,False) for fn in range(nfaces)]) #we init as false first {0: False, 1: False, 2: False, 3: False, 4: False, 5: False, 6: False, 7: False, 8: False, 9: False, 10: False, 11: False, 12: False, 13: False, ...}
+        for aob in anatomies:
+            for face in aob.data.DazMaskGroup: # DazMaskGroup = hidden_polys
+                fmasked[face.a] = True
+                masked_array.append(face.a)
+
+        print("masked array is:\n")
+        print (str(masked_array)[1:-1]) 
+        # If cob is itself a geograft, make sure to keep the boundary
+        if cob.data.DazGraftGroup:
+            cgrafts = [pair.a for pair in cob.data.DazGraftGroup]
+        else:
+            cgrafts = [] # but if cob is not a geograft, then cgrafts is emtpy
+
+        bpy.ops.object.mode_set(mode='EDIT')
+        bpy.ops.mesh.select_all(action='DESELECT')
+        bpy.ops.object.mode_set(mode='OBJECT')
+
+        # Select body verts to delete
+        vdeleted = dict([(vn,False) for vn in range(nverts)])
+        for aob in anatomies:
+            paired = [pair.b for pair in aob.data.DazGraftGroup]
+            for face in aob.data.DazMaskGroup:  # for every hidden_face
+                fverts = cob.data.polygons[face.a].vertices #face.a is the index of the hidden_face
+                vdelete = []
+                for vn in fverts: #this is an actually _for_loop_ for every vertex that belongs to a face that is a hidden_face
+                    if vn in cgrafts:
+                        pass
+                    elif vn not in paired: #if the vertex belongs to a hidden_face, but is not in vertex_pairs (common in both meshes)
+                        vdelete.append(vn) # then we add it to the deletion list
+                    else:
+                        mfaces = [fn for fn in vfaces[vn] if fmasked[fn]] # this is a dictionary like vfaces, but only if is masked
+                        if len(mfaces) == len(vfaces[vn]):                # so for a vertex (vn is the index) we look at adiacent faces and put all those faces in an array
+                            vdelete.append(vn)                            # and if the mfaces (all faces adiacent to an index that are hidden_face-s) is the same as the all faces adiacent
+                #                                                         # more exactly, in simple translate, if all faces adiacent to a vertex are also hidden
+                #                                                         # then we add that vertex index to the deletion list
+                for vn in vdelete:                         
+                    cob.data.vertices[vn].select = True
+                    vdeleted[vn] = True
+
+        # Build association table between new and old vertex numbers
+        assoc = {}  #when we delete the vertices, a remaining vertex takes the position of the deleted one, vertices index is shifted
+        vn2 = 0     #so vn2 is the new vn vertex
+        for vn in range(nverts):
+            if not vdeleted[vn]:
+                assoc[vn] = vn2
+                vn2 += 1
+
+        aobDazGraftGroupCounter = len (aob.data.DazGraftGroup)
+        newVertexGroupPrefix = id_generator()+id_generator()+"_"
+        for index,pair in enumerate(aob.data.DazGraftGroup):
+            newVertexGroup = aob.vertex_groups.new(name=newVertexGroupPrefix+str(index))
+            newVertexGroup.add([pair.a], 0.0, 'ADD')
+            newVertexGroup = cob.vertex_groups.new(name=newVertexGroupPrefix+str(index))
+            newVertexGroup.add([pair.b], 0.0, 'ADD')
+        
+        aobVerts = [v.index for v in aob.data.vertices]
+        newVertexGroup = aob.vertex_groups.new(name=newVertexGroupPrefix+"all_vertices")
+        newVertexGroup.add(aobVerts, 0.0, 'ADD')
+
+        # Delete the masked verts
+        bpy.ops.object.mode_set(mode='EDIT')
+        #bpy.ops.mesh.delete(type='VERT')
+        bpy.ops.object.mode_set(mode='OBJECT')
+
+        # If cob is itself a geograft, store locations
+        if cob.data.DazGraftGroup:
+            verts = cob.data.vertices
+            locations = dict([(pair.a, verts[pair.a].co.copy()) for pair in cob.data.DazGraftGroup])
+
+
+        #hfg2 changes
+        # first Select both graft and body and deselect vertices in edit mode
+        # Select verts on common boundary
+        names = []
+        for aob in anatomies:
+            setSelected(aob, True)
+            names.append(aob.name)
+        
+        print("Merge %s to %s" % (names, cob.name))
+
+
+        activateObject(context, cob)
+        bpy.ops.object.mode_set(mode='EDIT')
+        bpy.ops.mesh.select_all(action='DESELECT')
+        bpy.ops.object.mode_set(mode='OBJECT')
+
+        for aob in anatomies:
+            activateObject(context, aob)
+            setSelected(aob, True)
+            bpy.ops.object.mode_set(mode='EDIT')
+            bpy.ops.mesh.select_all(action='DESELECT')
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+        activateObject(context, cob)
+        setSelected(cob, True)
+        bpy.ops.object.mode_set(mode='EDIT')
+        bpy.ops.mesh.select_all(action='DESELECT')
+        bpy.ops.object.mode_set(mode='OBJECT')
+
+        setSelected(aob, True)
+        activateObject(context, cob)
+        setSelected(aob, True)
+        
+
+
+
+        bpy.ops.object.join()
+        
+        # Deselect all verts
+        bpy.ops.object.mode_set( mode = 'EDIT' )
+        bpy.ops.mesh.select_all( action = 'DESELECT' )
+        #bpy.ops.object.mode_set( mode = 'OBJECT' )
+        #bpy.ops.object.mode_set(mode="EDIT")        
+        #all vertex groups starts with newVertexGroupPrefix + +str(index)
+        threshold = 0.001*cob.DazScale
+        vgroups = cob.vertex_groups
+        
+        for index in range(aobDazGraftGroupCounter): # for index,notUsed in enumerate(aob.data.DazGraftGroup):
+            print("Selecting indices for group: "+str(newVertexGroupPrefix+str(index)))
+            vgroups.active_index = vgroups[newVertexGroupPrefix+str(index)].index
+            bpy.ops.object.vertex_group_select()
+            #bpy.ops.mesh.merge(type='CENTER', uvs=False)
+            bpy.ops.mesh.remove_doubles(threshold=threshold)
+            bpy.ops.object.vertex_group_deselect()
+            #bpy.ops.mesh.select_all( action = 'DESELECT' )
+            #bpy.ops.object.mode_set(mode='OBJECT')
+            # Now the selected vertices are the ones that belong to this VG
+            #vgVerts = [ v for v in o.data.vertices if v.select ]
+
+            #   [vert for vert in cob.data.vertices if cob.vertex_groups[newVertexGroupPrefix+str(index)].index in [i.group for i in vert.groups]]
+            # vg_idx = 0
+            #o = bpy.context.object
+            #vs = [ v for v in o.data.vertices if vg_idx in [ vg.group for vg in v.groups ] ]
+        
+        bpy.ops.object.mode_set(mode='OBJECT')
+        bpy.ops.object.mode_set(mode="EDIT")
+
+        for index in range(aobDazGraftGroupCounter): #for index,notUsed in enumerate(aob.data.DazGraftGroup):
+            vgroups.active_index = vgroups[newVertexGroupPrefix+str(index)].index
+            bpy.ops.object.vertex_group_select()
+        vgroups.active_index = vgroups[newVertexGroupPrefix+"all_vertices"].index
+        bpy.ops.object.vertex_group_select()
+
+        #if 1==True:
+        #    return {'FINISHED'}
+
+        selected = dict([(v.index,v.co.copy()) for v in cob.data.vertices if v.select])
+
+        bpy.ops.object.mode_set(mode='OBJECT')
+
+        if True == False :
+            #if 1==True:
+            #    return {'FINISHED'}
+            # ///////////////////////////////////////////////////////////// old code ///////////////////////////////////
+            # Select nothing
+            for aob in anatomies:
+                activateObject(context, aob)
+                bpy.ops.object.mode_set(mode='EDIT')
+                bpy.ops.mesh.select_all(action='DESELECT')
+                bpy.ops.object.mode_set(mode='OBJECT')
+            activateObject(context, cob)
+            bpy.ops.object.mode_set(mode='EDIT')
+            bpy.ops.mesh.select_all(action='DESELECT')
+            bpy.ops.object.mode_set(mode='OBJECT')
+            # Select verts on common boundary
+            names = []
+            for aob in anatomies:
+                setSelected(aob, True)
+                names.append(aob.name)
+                for pair in aob.data.DazGraftGroup:
+                    aob.data.vertices[pair.a].select = True
+                    if pair.b in assoc.keys():
+                        cvn = assoc[pair.b]
+                        cob.data.vertices[cvn].select = True
+            
+            
+            # Also select cob graft group. These will not be removed.
+            if cob.data.DazGraftGroup:
+                for pair in cob.data.DazGraftGroup:
+                    cvn = assoc[pair.a]
+                    cob.data.vertices[cvn].select = True
+
+
+
+            # Join meshes and remove doubles
+            print("Merge %s to %s" % (names, cob.name))
+            threshold = 0.001*cob.DazScale
+            bpy.ops.object.join()
+            bpy.ops.object.mode_set(mode='EDIT')
+            bpy.ops.mesh.remove_doubles(threshold=threshold)
+            bpy.ops.object.mode_set(mode='OBJECT')
+            selected = dict([(v.index,v.co.copy()) for v in cob.data.vertices if v.select])
+            bpy.ops.object.mode_set(mode='EDIT')
+            if 1==True:
+                return {'FINISHED'}
+            bpy.ops.mesh.select_all(action='DESELECT')
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+        # Update cob graft group
+        if cob.data.DazGraftGroup and selected:
+            for pair in cob.data.DazGraftGroup:
+                x = locations[pair.a]
+                dists = [((x-y).length, vn) for vn,y in selected.items()]
+                dists.sort()
+                pair.a = dists[0][1]
+
+        self.joinUvTextures(cob.data)
+
+        #hfg2 cleanup merging groups, since we no longer need those we can remove them
+        vgs = [vg for vg in cob.vertex_groups if vg.name.find(newVertexGroupPrefix) != -1]
+        while(vgs):
+            cob.vertex_groups.remove(vgs.pop())
+
+        newname = self.getUvName(cob.data)
+        for mat in cob.data.materials:
+            if mat.use_nodes:
+                replaceNodeNames(mat, cname, newname)
+                for aname in anames:
+                    replaceNodeNames(mat, aname, newname)
+
+        # Remove unused materials
+        self.mathits = dict([(mn,False) for mn in range(len(cob.data.materials))])
+        for f in cob.data.polygons:
+            self.mathits[f.material_index] = True
+        self.mergeMaterials(cob)
+
+        copyShapeKeyDrivers(cob, drivers)
+        updateDrivers(cob)
+            """
+    
+    def keepMaterial(self, mn, mat, ob):
+        keep = self.mathits[mn]
+        if not keep:
+            print("Remove material %s" % mat.name)
+        return keep
+
+
+    def moveGraftVerts(self, aob, cob):
+        """ This function moves all common geograft vertices to the location of the coresponding vertices.\n It also `fixes` the vertices in shared shapekey names"""
+        for pair in aob.data.DazGraftGroup:
+            print("{0:d},{1:d}".format(pair.a,pair.b))
+            aob.data.vertices[pair.a].co = cob.data.vertices[pair.b].co
+        if cob.data.shape_keys and aob.data.shape_keys:
+            for cskey in cob.data.shape_keys.key_blocks:
+                if cskey.name in aob.data.shape_keys.key_blocks.keys():
+                    askey = aob.data.shape_keys.key_blocks[cskey.name]
+                    for pair in aob.data.DazGraftGroup:
+                        askey.data[pair.a].co = cskey.data[pair.b].co
+
+
+    def joinUvTextures(self, me):
+        if len(me.uv_layers) <= 1:
+            return
+        for n,data in enumerate(me.uv_layers[0].data):
+            if data.uv.length < 1e-6:
+                for uvloop in me.uv_layers[1:]:
+                    if uvloop.data[n].uv.length > 1e-6:
+                        data.uv = uvloop.data[n].uv
+                        break
+        for uvtex in list(getUvTextures(me)[1:]):
+            if uvtex.name not in self.keepUv:
+                try:
+                    getUvTextures(me).remove(uvtex)
+                except RuntimeError:
+                    print("Cannot remove texture layer '%s'" % uvtex.name)
+
+
+    def getUvName(self, me):
+        for uvtex in getUvTextures(me):
+            if uvtex.active_render:
+                return uvtex.name
+        return None
+
 
 class DAZ_OT_MergeGeografts(DazOperator, MaterialMerger, IsMesh):
     bl_idname = "daz.merge_geografts"
@@ -115,7 +624,7 @@ class DAZ_OT_MergeGeografts(DazOperator, MaterialMerger, IsMesh):
         masked_array =[]  #added by me
         nfaces = len(cob.data.polygons)
         #fmasked is going to tell me which face is masked (which face index)
-        fmasked = dict([(fn,False) for fn in range(nfaces)]) #{0: False, 1: False, 2: False, 3: False, 4: False, 5: False, 6: False, 7: False, 8: False, 9: False, 10: False, 11: False, 12: False, 13: False, ...}
+        fmasked = dict([(fn,False) for fn in range(nfaces)]) #we init as false first {0: False, 1: False, 2: False, 3: False, 4: False, 5: False, 6: False, 7: False, 8: False, 9: False, 10: False, 11: False, 12: False, 13: False, ...}
         for aob in anatomies:
             for face in aob.data.DazMaskGroup: # DazMaskGroup = hidden_polys
                 fmasked[face.a] = True
@@ -177,7 +686,7 @@ class DAZ_OT_MergeGeografts(DazOperator, MaterialMerger, IsMesh):
 
         # Delete the masked verts
         bpy.ops.object.mode_set(mode='EDIT')
-        bpy.ops.mesh.delete(type='VERT')
+        #bpy.ops.mesh.delete(type='VERT')
         bpy.ops.object.mode_set(mode='OBJECT')
 
         # If cob is itself a geograft, store locations
@@ -354,6 +863,7 @@ class DAZ_OT_MergeGeografts(DazOperator, MaterialMerger, IsMesh):
 
 
     def moveGraftVerts(self, aob, cob):
+        """ This function moves all common geograft vertices to the location of the coresponding vertices.\n It also `fixes` the vertices in shared shapekey names"""
         for pair in aob.data.DazGraftGroup:
             print("{0:d},{1:d}".format(pair.a,pair.b))
             aob.data.vertices[pair.a].co = cob.data.vertices[pair.b].co
@@ -1052,6 +1562,7 @@ class EditBoneStorage:
 
 classes = [
     DAZ_OT_MergeGeografts,
+    DAZ_OT_MergeGeograftsFast,
     DAZ_OT_CreateGraftGroups,
     DAZ_OT_MergeUVLayers,
     DAZ_OT_CopyPoses,

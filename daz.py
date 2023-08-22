@@ -374,6 +374,7 @@ class DAZ_PT_Setup(bpy.types.Panel):
             if bpy.app.version >= (2,82,0):
                 box.operator("daz.set_udims")
             box.operator("daz.merge_geografts")
+            box.operator("daz.merge_geografts_fast")
             if bpy.app.version >= (2,82,0):
                 box.operator("daz.make_udim_materials")
             box.operator("daz.merge_uv_layers")
